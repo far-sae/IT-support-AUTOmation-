@@ -1,0 +1,8 @@
+{
+  "apiUrl": "http://localhost:4000",
+  "token": "relay_agent_PASTE_THE_TOKEN_HERE",
+  "interval": 60,
+  "hostname": "MY-LAPTOP-01",
+  "assignedUser": "Jordan Employee",
+  "type": "LAPTOP"
+}

@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay-server
+  namespace: relay
+  labels: { app: relay-server }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: relay-server }
+  template:
+    metadata:
+      labels: { app: relay-server }
+      annotations:
+        # Phase 11 — Prometheus scrape.
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "4000"
+        prometheus.io/path:   "/metrics"
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/your-org/relay-server:latest  # CHANGE
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 4000, name: http }]
+          envFrom:
+            - configMapRef: { name: relay-config }
+            - secretRef:    { name: relay-secrets }
+          # Run migrations on first boot — idempotent for subsequent pods.
+          command: ["sh", "-lc"]
+          args:
+            - |
+              set -e
+              npx prisma migrate deploy --schema=prisma/schema.prisma
+              node dist/index.js
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: 1500m, memory: 1Gi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay-server
+  namespace: relay
+  labels: { app: relay-server }
+spec:
+  ports: [{ port: 80, targetPort: http, name: http }]
+  selector: { app: relay-server }
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: relay-server
+  namespace: relay
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: relay-server
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu,    target: { type: Utilization, averageUtilization: 70 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 80 } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: relay-server
+  namespace: relay
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: relay-server }

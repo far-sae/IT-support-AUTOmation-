@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay-client
+  namespace: {{ include "relay.namespace" . }}
+  labels:
+    app: relay-client
+    {{- include "relay.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.client.replicas }}
+  selector:
+    matchLabels: { app: relay-client }
+  template:
+    metadata:
+      labels: { app: relay-client }
+    spec:
+      containers:
+        - name: client
+          image: "{{ .Values.image.client.repository }}:{{ .Values.image.client.tag }}"
+          imagePullPolicy: {{ .Values.image.client.pullPolicy }}
+          ports: [{ containerPort: 80, name: http }]
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources: {{- toYaml .Values.client.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay-client
+  namespace: {{ include "relay.namespace" . }}
+  labels:
+    app: relay-client
+    {{- include "relay.labels" . | nindent 4 }}
+spec:
+  ports: [{ port: 80, targetPort: http, name: http }]
+  selector: { app: relay-client }
+  type: ClusterIP

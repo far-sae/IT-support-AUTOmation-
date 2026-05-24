@@ -1,0 +1,9 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "relay.namespace" . }}
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: baseline
+{{- end }}

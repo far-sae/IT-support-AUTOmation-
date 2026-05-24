@@ -1,0 +1,39 @@
+# Assumes ingress-nginx + cert-manager. Adjust to your ingress controller.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: relay
+  namespace: relay
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+    # Socket.IO needs sticky sessions and a long timeout.
+    nginx.ingress.kubernetes.io/affinity:           "cookie"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["relay.example.com"]
+      secretName: relay-tls
+  rules:
+    - host: relay.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: relay-server, port: { name: http } }
+          - path: /socket.io
+            pathType: Prefix
+            backend:
+              service: { name: relay-server, port: { name: http } }
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service: { name: relay-server, port: { name: http } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: relay-client, port: { name: http } }

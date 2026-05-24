@@ -1,0 +1,14 @@
+{
+  "name": "@relay/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight cross-platform asset-discovery agent for Relay.",
+  "bin": {
+    "relay-agent": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "once":  "node src/index.mjs --once"
+  }
+}

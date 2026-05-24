@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relay-config
+  namespace: relay
+data:
+  # Non-secret runtime config. Secrets live in `relay-secrets`.
+  NODE_ENV:                    "production"
+  PORT:                        "4000"
+  CLIENT_URL:                  "https://relay.example.com"
+  LOG_LEVEL:                   "info"
+  # AI brain
+  USE_AI_TRIAGE:               "true"
+  USE_AI_BRAIN:                "true"
+  BRAIN_MODEL:                 "claude-haiku-4-5-20251001"
+  BRAIN_MAX_ITERATIONS:        "6"
+  AUTOPILOT_INTERVAL_MINUTES:  "1"
+  # SLA + briefs + detection + workflows + ML
+  SLA_CHECK_INTERVAL_MINUTES:  "5"
+  AGENT_STALE_MINUTES:         "15"
+  DAILY_BRIEF_CRON:            "0 8 * * *"
+  DETECTION_INTERVAL_MINUTES:  "5"
+  WORKFLOW_TICK_MINUTES:       "1"
+  ML_TRAIN_CRON:               "0 3 * * *"
+  # Email defaults
+  SMTP_FROM:                   "Relay Support <support@relay.example.com>"
+  IMAP_TLS:                    "true"
+  IMAP_POLL_SECONDS:           "60"
+  # S3
+  S3_REGION:                   "us-east-1"
+  S3_BUCKET:                   "relay-attachments"
+  S3_FORCE_PATH_STYLE:         "false"
+  # Phase 12 — event bus + ES
+  KAFKA_CLIENT_ID:             "relay-server"
+  KAFKA_TOPIC_PREFIX:          "relay."
+  ELASTICSEARCH_INDEX_PREFIX:  "relay"
+  ELASTICSEARCH_LOGS_PREFIX:   "relay-logs"
+  # Phase 14 — infra binaries
+  TERRAFORM_BIN:               "terraform"
+  ANSIBLE_BIN:                 "ansible-playbook"
+  # Phase 15 — observability defaults
+  CLOUDWATCH_LOG_STREAM:        "relay-server"
+  CLOUDWATCH_METRICS_INTERVAL_SECONDS: "60"
+  AWS_REGION:                  "us-east-1"
+  AZURE_MONITOR_LOG_TYPE:      "RelayServer"
+  # Phase 17 — OPA
+  OPA_DECISION_PATH:           "relay/allow"

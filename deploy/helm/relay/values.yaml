@@ -1,0 +1,135 @@
+# Relay Helm chart — default values.
+#
+# Override with `helm install relay deploy/helm/relay -f my-values.yaml`.
+
+namespace:
+  create: true
+  name: relay
+
+image:
+  server:
+    repository: ghcr.io/your-org/relay-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  client:
+    repository: ghcr.io/your-org/relay-client
+    tag: latest
+    pullPolicy: IfNotPresent
+
+server:
+  replicas: 2
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: 1500m, memory: 1Gi }
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    cpuUtilization: 70
+    memoryUtilization: 80
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  prometheusScrape: true
+
+client:
+  replicas: 2
+  resources:
+    requests: { cpu: 50m,  memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+# Single-node Postgres for demos. For prod, set `enabled: false` and point
+# DATABASE_URL at your managed DB.
+postgres:
+  enabled: true
+  storageSize: 20Gi
+  storageClass: ""
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
+
+ingress:
+  enabled: true
+  className: nginx
+  host: relay.example.com
+  tls:
+    enabled: true
+    secretName: relay-tls
+    clusterIssuer: letsencrypt-prod
+
+networkPolicy:
+  enabled: true
+
+# Non-secret config copied verbatim into the ConfigMap.
+config:
+  NODE_ENV:                    "production"
+  PORT:                        "4000"
+  CLIENT_URL:                  "https://relay.example.com"
+  LOG_LEVEL:                   "info"
+  USE_AI_TRIAGE:               "true"
+  USE_AI_BRAIN:                "true"
+  BRAIN_MODEL:                 "claude-haiku-4-5-20251001"
+  BRAIN_MAX_ITERATIONS:        "6"
+  AUTOPILOT_INTERVAL_MINUTES:  "1"
+  SLA_CHECK_INTERVAL_MINUTES:  "5"
+  AGENT_STALE_MINUTES:         "15"
+  DAILY_BRIEF_CRON:            "0 8 * * *"
+  DETECTION_INTERVAL_MINUTES:  "5"
+  WORKFLOW_TICK_MINUTES:       "1"
+  ML_TRAIN_CRON:               "0 3 * * *"
+  SMTP_FROM:                   "Relay Support <support@relay.example.com>"
+  IMAP_TLS:                    "true"
+  IMAP_POLL_SECONDS:           "60"
+  S3_REGION:                   "us-east-1"
+  S3_BUCKET:                   "relay-attachments"
+  S3_FORCE_PATH_STYLE:         "false"
+  KAFKA_CLIENT_ID:             "relay-server"
+  KAFKA_TOPIC_PREFIX:          "relay."
+  ELASTICSEARCH_INDEX_PREFIX:  "relay"
+  ELASTICSEARCH_LOGS_PREFIX:   "relay-logs"
+  TERRAFORM_BIN:               "terraform"
+  ANSIBLE_BIN:                 "ansible-playbook"
+  CLOUDWATCH_LOG_STREAM:        "relay-server"
+  CLOUDWATCH_METRICS_INTERVAL_SECONDS: "60"
+  AWS_REGION:                  "us-east-1"
+  AZURE_MONITOR_LOG_TYPE:      "RelayServer"
+  OPA_DECISION_PATH:           "relay/allow"
+
+# Secrets — prefer `--set-file` / sealed-secrets / external-secrets in
+# real deployments. Anything left blank is omitted from the rendered Secret.
+secrets:
+  DATABASE_URL: ""
+  JWT_SECRET:   ""
+  ANTHROPIC_API_KEY: ""
+  SMTP_HOST: ""
+  SMTP_PORT: ""
+  SMTP_USER: ""
+  SMTP_PASS: ""
+  IMAP_HOST: ""
+  IMAP_PORT: ""
+  IMAP_USER: ""
+  IMAP_PASS: ""
+  IMAP_DEFAULT_ORG_SLUG: ""
+  GOOGLE_CLIENT_ID:     ""
+  GOOGLE_CLIENT_SECRET: ""
+  MICROSOFT_CLIENT_ID:     ""
+  MICROSOFT_CLIENT_SECRET: ""
+  S3_ENDPOINT:   ""
+  S3_ACCESS_KEY: ""
+  S3_SECRET_KEY: ""
+  SLACK_WEBHOOK_URL: ""
+  GITHUB_TOKEN:      ""
+  KAFKA_BROKERS:        ""
+  ELASTICSEARCH_URL:    ""
+  ELASTICSEARCH_API_KEY: ""
+  FIREWALL_API_TOKEN:    ""
+  SERVICENOW_API_TOKEN:  ""
+  JIRA_API_TOKEN:        ""
+  SPLUNK_HEC_URL:        ""
+  SPLUNK_HEC_TOKEN:      ""
+  SPLUNK_HEC_INDEX:      ""
+  CLOUDWATCH_LOG_GROUP:          ""
+  CLOUDWATCH_METRICS_NAMESPACE:  ""
+  AZURE_MONITOR_WORKSPACE_ID:    ""
+  AZURE_MONITOR_SHARED_KEY:      ""
+  OPA_URL:                       ""

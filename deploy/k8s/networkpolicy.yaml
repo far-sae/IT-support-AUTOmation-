@@ -1,0 +1,53 @@
+# Default-deny ingress to anything in the relay namespace, then allow:
+#   • client ← from any pod with the "ingress-nginx" label (the LB)
+#   • server ← from client + ingress
+#   • postgres ← from server only
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: relay-default-deny
+  namespace: relay
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: relay-client
+  namespace: relay
+spec:
+  podSelector: { matchLabels: { app: relay-client } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+      ports: [{ port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: relay-server
+  namespace: relay
+spec:
+  podSelector: { matchLabels: { app: relay-server } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+        - podSelector:        { matchLabels: { app: relay-client } }
+      ports: [{ port: 4000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: relay-postgres
+  namespace: relay
+spec:
+  podSelector: { matchLabels: { app: relay-postgres } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: relay-server } }
+      ports: [{ port: 5432 }]

@@ -1,0 +1,983 @@
+// Relay — Prisma schema (Phase 6 — multi-tenant)
+//
+// Tenancy summary:
+//   • New `Organization` model owns every tenant-scoped row.
+//   • EVERY tenant-owned model has `organizationId String` + an FK to Organization
+//     (ON DELETE CASCADE).
+//   • Previously-global unique constraints (User.email, Ticket.refCode,
+//     Device.hostname, ServiceComponent.name) become COMPOUND uniques on
+//     [organizationId, <col>] — the same email/refCode/hostname can exist in
+//     two different organizations.
+//   • Platform admins are still stored inside an organization (typically the
+//     "Relay Platform" org) but carry `isPlatformAdmin = true` which grants
+//     cross-org powers in the API layer.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────
+
+enum Role {
+  EMPLOYEE
+  AGENT
+  ADMIN
+}
+
+enum AuthProvider {
+  LOCAL
+  GOOGLE
+  MICROSOFT
+}
+
+enum TicketSource {
+  PORTAL
+  EMAIL
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum DeviceType {
+  LAPTOP
+  DESKTOP
+  MOBILE
+}
+
+enum HealthStatus {
+  HEALTHY
+  WARNING
+  CRITICAL
+}
+
+enum DiscoverySource {
+  MANUAL
+  AGENT
+}
+
+enum SessionStatus {
+  CONNECTING
+  LIVE
+  ENDED
+}
+
+enum ComponentStatus {
+  OPERATIONAL
+  DEGRADED
+  OUTAGE
+}
+
+enum IncidentStatus {
+  INVESTIGATING
+  IDENTIFIED
+  MONITORING
+  RESOLVED
+}
+
+enum IncidentImpact {
+  MINOR
+  MAJOR
+  CRITICAL
+}
+
+enum RunbookStatus {
+  RUNNING                // execute() in-flight
+  SUCCEEDED              // ran cleanly; ticket closed if the runbook called for it
+  FAILED                 // execute() threw or returned failure
+  AWAITING_USER          // (legacy) human Yes/No — kept for older rows, no longer produced
+  AWAITING_AGENT         // HIGH-risk runbook queued for one-click agent approval
+  AWAITING_VERIFICATION  // Phase 10B — system-driven verification: timer + user-reply detection
+  CANCELLED              // user-rejected or agent-dismissed
+}
+
+enum RunbookRisk {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// Phase 10C — agent-driven local remediation.
+enum AgentActionKind {
+  RUN_DIAGNOSTIC
+  RESTART_SERVICE
+  CLEAR_CACHE
+  DISK_CLEANUP
+  APPLY_PENDING_UPDATES
+  // Phase 11 — rollback path for failed updates.
+  ROLL_BACK_LAST_PATCH
+  // Phase 11 — server-side action runners (no agent involvement);
+  // kept on the same model for one timeline-view per device.
+  TRIGGER_GITHUB_WORKFLOW
+}
+
+enum AgentActionStatus {
+  QUEUED        // created by a runbook, waiting for the agent to poll
+  IN_PROGRESS   // agent picked it up
+  SUCCEEDED     // agent reported success
+  FAILED        // agent reported failure
+  EXPIRED       // never picked up within the dispatch window
+  CANCELLED     // staff cancelled before pickup
+}
+
+// Phase 12 — Sigma-style detection.
+enum DetectionSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// Phase 13 — multi-step workflow orchestration.
+enum WorkflowExecutionStatus {
+  RUNNING            // executor is actively advancing through steps
+  WAITING            // current step asked to sleep until a time or signal
+  AWAITING_APPROVAL  // a manual-approval step paused the flow
+  SUCCEEDED          // every step ran to completion
+  FAILED             // an irrecoverable error past compensation
+  CANCELLED          // an admin or agent stopped it
+  COMPENSATING       // unwinding completed steps after a failure
+}
+
+enum WorkflowStepStatus {
+  PENDING            // not started yet
+  RUNNING            // currently executing
+  WAITING            // step returned WAITING; will resume at resumeAt or on signal
+  SUCCEEDED
+  FAILED
+  SKIPPED            // a branch chose another path
+  COMPENSATED        // ran in reverse during compensation
+}
+
+// ─── Tenancy core ─────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  // Free-form per-tenant settings — branding, default SLA overrides, etc.
+  // A typed view of this lives in code (server/src/tenant/settings.ts).
+  settings  Json     @default("{}")
+  // Soft-suspend flag so a platform admin can disable a tenant without
+  // dropping data. Suspended orgs reject auth at the middleware layer.
+  suspendedAt DateTime?
+  createdAt DateTime @default(now())
+
+  users             User[]
+  invites           OrgInvite[]
+  tickets           Ticket[]
+  comments          Comment[]
+  attachments       Attachment[]
+  surveyResponses   SurveyResponse[]
+  devices           Device[]
+  remoteSessions    RemoteSession[]
+  kbArticles        KbArticle[]
+  serviceComponents ServiceComponent[]
+  incidents         Incident[]
+  deviceMetrics     DeviceMetric[]
+  agentTokens       AgentEnrollmentToken[]
+  runbookExecutions RunbookExecution[]
+  outcomes          RemediationOutcome[]
+  agentActions      AgentAction[]
+  ticketEmbeddings  TicketEmbedding[]
+  dailyBriefs       DailyBrief[]
+  detectionHits     DetectionHit[]
+  workflowExecutions WorkflowExecution[]
+  mlModels          MlModel[]
+  remediationAttempts RemediationAttempt[]
+  threatMatches     ThreatMatch[]
+  defenderRuns      DefenderRun[]
+  sensorAlerts      SensorAlert[]
+  generatedRules    GeneratedRule[]
+}
+
+model OrgInvite {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  role           Role
+  token          String    @unique
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+// ─── Tenant-owned models ──────────────────────────────────────────────
+
+model User {
+  id              String       @id @default(cuid())
+  organizationId  String
+  name            String
+  email           String
+  passwordHash    String?
+  authProvider    AuthProvider @default(LOCAL)
+  role            Role         @default(EMPLOYEE)
+  // Cross-org powers (create/list/suspend organizations). Kept ORTHOGONAL
+  // to `role` so a platform admin still has an org-scoped role in their
+  // home organization (typically "Relay Platform").
+  isPlatformAdmin Boolean      @default(false)
+  createdAt       DateTime     @default(now())
+
+  organization     Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticketsSubmitted Ticket[]         @relation("TicketSubmitter")
+  ticketsAssigned  Ticket[]         @relation("TicketAgent")
+  comments         Comment[]
+  attachments      Attachment[]
+  remoteSessions   RemoteSession[]
+  approvedRunbooks RunbookExecution[]
+
+  // Email is unique WITHIN an organization, not globally — the same user
+  // can have separate accounts in different tenants.
+  @@unique([organizationId, email])
+  @@index([email])
+}
+
+model Ticket {
+  id               String       @id @default(cuid())
+  organizationId   String
+  refCode          String
+  description      String
+  source           TicketSource @default(PORTAL)
+  submitterName    String
+  submitterEmail   String
+  submitterUserId  String?
+  assignedAgentId  String?
+
+  category         String
+  priority         String
+  assignedTeam     String
+  slaTarget        String
+  slaDueAt         DateTime
+  slaAlertedAt     DateTime?
+  confidence       Float
+  status           TicketStatus @default(OPEN)
+  autoReply        String
+
+  resolvedAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  submitter         User?        @relation("TicketSubmitter", fields: [submitterUserId], references: [id])
+  assignedAgent     User?        @relation("TicketAgent",     fields: [assignedAgentId], references: [id])
+  comments          Comment[]
+  attachments       Attachment[]
+  survey            SurveyResponse?
+  runbookExecutions RunbookExecution[]
+  embedding         TicketEmbedding?
+  workflowExecutions WorkflowExecution[]
+
+  // Ref codes (INC-1042) are unique PER organization, not globally.
+  @@unique([organizationId, refCode])
+  @@index([organizationId, status])
+  @@index([organizationId, priority])
+  @@index([organizationId, submitterEmail])
+  @@index([organizationId, slaDueAt])
+}
+
+model Comment {
+  id             String   @id @default(cuid())
+  organizationId String
+  ticketId       String
+  authorId       String
+  body           String
+  isInternal     Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author         User         @relation(fields: [authorId], references: [id])
+
+  @@index([organizationId, ticketId])
+}
+
+model Attachment {
+  id             String   @id @default(cuid())
+  organizationId String
+  ticketId       String
+  fileName       String
+  mimeType       String
+  sizeBytes      Int
+  storageKey     String   @unique
+  uploadedById   String?
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  uploadedBy     User?        @relation(fields: [uploadedById], references: [id])
+
+  @@index([organizationId, ticketId])
+}
+
+model SurveyResponse {
+  id             String    @id @default(cuid())
+  organizationId String
+  ticketId       String    @unique
+  // Tokens stay globally unique so the public /api/survey/:token route
+  // doesn't need to resolve an org first.
+  token          String    @unique
+  rating         Int?
+  comment        String?
+  sentAt         DateTime  @default(now())
+  submittedAt    DateTime?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+}
+
+model Device {
+  id              String          @id @default(cuid())
+  organizationId  String
+  hostname        String
+  assignedUser    String
+  type            DeviceType
+  os              String
+  healthStatus    HealthStatus    @default(HEALTHY)
+  diskUsage       Int             @default(0)
+  ramUsage        Int             @default(0)
+  patchStatus     String
+  lastSeenAt      DateTime        @default(now())
+  // Phase 7 — agent auto-discovery + telemetry
+  discoverySource DiscoverySource @default(MANUAL)
+  agentVersion    String?
+  lastCheckInAt   DateTime?
+
+  organization    Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  remoteSessions  RemoteSession[]
+  metrics         DeviceMetric[]
+  agentActions    AgentAction[]
+
+  @@unique([organizationId, hostname])
+  @@index([organizationId, healthStatus])
+}
+
+// Time-series of metrics reported by the agent — the /assets page draws a
+// 24-hour sparkline from this for each device.
+model DeviceMetric {
+  id             String   @id @default(cuid())
+  organizationId String
+  deviceId       String
+  cpu            Int      // 0-100
+  ram            Int      // 0-100
+  disk           Int      // 0-100
+  recordedAt     DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  device         Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, deviceId, recordedAt])
+}
+
+// Per-organization API keys used by agents to authenticate the check-in
+// endpoint. Created via the admin UI; tokens stay globally unique so the
+// agent can authenticate without sending an org id alongside.
+model AgentEnrollmentToken {
+  id             String    @id @default(cuid())
+  organizationId String
+  token          String    @unique
+  label          String
+  createdAt      DateTime  @default(now())
+  revokedAt      DateTime?
+  lastUsedAt     DateTime?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+model RemoteSession {
+  id             String        @id @default(cuid())
+  organizationId String
+  deviceId       String
+  agentId        String
+  status         SessionStatus @default(CONNECTING)
+  startedAt      DateTime      @default(now())
+  endedAt        DateTime?
+  eventLog       Json          @default("[]")
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  device         Device       @relation(fields: [deviceId], references: [id])
+  agent          User         @relation(fields: [agentId], references: [id])
+
+  @@index([organizationId, deviceId])
+  @@index([organizationId, agentId])
+}
+
+model KbArticle {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String
+  category       String
+  summary        String
+  steps          Json     @default("[]")
+  keywords       Json     @default("[]")
+  helpedCount    Int      @default(0)
+  readMinutes    Int      @default(2)
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, category])
+}
+
+model ServiceComponent {
+  id             String          @id @default(cuid())
+  organizationId String
+  name           String
+  status         ComponentStatus @default(OPERATIONAL)
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  incidents      Incident[]
+
+  // Each org names its own components — no global uniqueness.
+  @@unique([organizationId, name])
+}
+
+model Incident {
+  id             String           @id @default(cuid())
+  organizationId String
+  title          String
+  status         IncidentStatus   @default(INVESTIGATING)
+  impact         IncidentImpact   @default(MINOR)
+  componentId    String
+  startedAt      DateTime         @default(now())
+  resolvedAt     DateTime?
+  updates        Json             @default("[]")
+
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  component      ServiceComponent @relation(fields: [componentId], references: [id])
+
+  @@index([organizationId, status])
+  @@index([organizationId, componentId])
+}
+
+// Phase 10A — autonomous remediation.
+// One row per attempt to auto-resolve a ticket. The runbook catalog itself
+// lives in code (server/src/runbooks/registry.ts) so admins can update via
+// deploy without DB churn; the per-org enable/disable flag lives in
+// Organization.settings.disabledRunbooks (JSON string[]).
+model RunbookExecution {
+  id             String        @id @default(cuid())
+  organizationId String
+  ticketId       String
+  runbookKey     String        // matches the registry entry
+  status         RunbookStatus @default(RUNNING)
+  risk           RunbookRisk
+  confidence     Float
+  startedAt      DateTime      @default(now())
+  completedAt    DateTime?
+  decision       Json          @default("{}")   // free-form record of what ran
+  // Phase 10B — when in AWAITING_VERIFICATION, the cron auto-resolves at this time
+  // unless a negative signal (user reply, telemetry regression) arrives first.
+  verifyAt       DateTime?
+  // Chronological brain reasoning, captured between tool calls.
+  // Shape: [{ at: ISOString, role: "system"|"assistant"|"tool", text: string }]
+  brainLog       Json          @default("[]")
+  approvedById   String?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  approvedBy     User?        @relation(fields: [approvedById], references: [id])
+  agentActions   AgentAction[]
+
+  @@index([organizationId, ticketId])
+  @@index([organizationId, status])
+  @@index([verifyAt])
+}
+
+// Phase 10B — outcome learning. Every time a RunbookExecution finalizes
+// (SUCCEEDED/FAILED/CANCELLED), we increment a counter scoped to the
+// org × ticket "signature" × runbook key. The brain reads these stats to
+// weight future choices, so successful runbooks rise and failing ones fall
+// for that org's particular flavor of tickets.
+model RemediationOutcome {
+  id             String   @id @default(cuid())
+  organizationId String
+  // Normalized fingerprint of the ticket — category + sorted tokens.
+  // Built by learning/store.ts so the lookup is deterministic.
+  signature      String
+  runbookKey     String
+  successes      Int      @default(0)
+  failures       Int      @default(0)
+  escalations    Int      @default(0)
+  updatedAt      DateTime @updatedAt @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, signature, runbookKey])
+  @@index([organizationId, signature])
+}
+
+// Phase 10C — agent-dispatched local action.
+// Created by a Tier 2 runbook; picked up by the device's agent via
+// GET /api/agent/actions; result reported via POST /api/agent/actions/:id/result.
+// When linked to a RunbookExecution, settling the action also settles the run.
+model AgentAction {
+  id                 String            @id @default(cuid())
+  organizationId     String
+  deviceId           String
+  runbookExecutionId String?
+  kind               AgentActionKind
+  input              Json              @default("{}")
+  status             AgentActionStatus @default(QUEUED)
+  result             Json              @default("{}")
+  createdAt          DateTime          @default(now())
+  dispatchedAt       DateTime?         // when the agent first fetched it
+  completedAt        DateTime?
+
+  organization       Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  device             Device            @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  runbookExecution   RunbookExecution? @relation(fields: [runbookExecutionId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, deviceId, status])
+  @@index([runbookExecutionId])
+}
+
+// Phase 11 — vector memory.
+// One embedding per resolved ticket. The brain semantic-searches this so a
+// new ticket finds past resolutions even when the wording is different.
+// Vectors are dense, fixed-dimension floats stored as JSON (a 256-element
+// array). Postgres handles ~10k rows fine without pgvector; we compute
+// cosine similarity in Node when searching.
+model TicketEmbedding {
+  id             String   @id @default(cuid())
+  organizationId String
+  ticketId       String   @unique
+  // The text that was embedded — usually `${category}: ${description}`.
+  text           String
+  // 256-float dense vector, JSON-encoded.
+  vector         Json
+  // Embedder used (e.g. "local-hash-256" or "voyage-3-lite") so we can
+  // re-index if we change strategies.
+  model          String   @default("local-hash-256")
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket         Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+// Phase 11 — daily AI brief.
+// One row per (org, day). Generated by the dailyBrief cron at 08:00.
+model DailyBrief {
+  id             String   @id @default(cuid())
+  organizationId String
+  // YYYY-MM-DD bucket the brief covers (the day BEFORE the cron fires).
+  forDate        DateTime
+  markdown       String
+  // Numeric snapshot used by the dashboard widget.
+  stats          Json     @default("{}")
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, forDate])
+  @@index([organizationId, createdAt])
+}
+
+// Phase 12 — Detection hits.
+//
+// A `DetectionHit` is a row created when a Sigma-style rule fires against
+// recent ticket / runbook / device activity. Rule definitions live in code
+// (server/src/detect/builtins.ts) — only the *firings* are persisted, plus
+// any per-org enable/disable lives in Organization.settings.disabledDetectionRules.
+//
+// Each hit captures the evidence (matching ticket IDs, counters, time window)
+// so an analyst can audit why it fired. Hits are deduped by
+// (organizationId, ruleKey, windowStart) — the same burst doesn't create a
+// new row each time the cron ticks within the window.
+model DetectionHit {
+  id             String              @id @default(cuid())
+  organizationId String
+  ruleKey        String
+  severity       DetectionSeverity
+  count          Int                 @default(0)
+  windowStart    DateTime
+  windowEnd      DateTime
+  // Free-form evidence — JSON object containing matching ticket refCodes,
+  // device hostnames, runbook keys, raw counts, etc.
+  evidence       Json                @default("{}")
+  // Once an admin reviews a hit, it's acknowledged + hidden from active list.
+  acknowledgedAt DateTime?
+  acknowledgedBy String?
+  createdAt      DateTime            @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, ruleKey, windowStart])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, acknowledgedAt])
+}
+
+// Phase 13 — multi-step workflow execution.
+//
+// A `WorkflowExecution` is the running instance of a named, in-code workflow
+// (registry in server/src/workflows/registry.ts) against a specific ticket.
+// State is Postgres-durable so the executor can crash and resume — every
+// step transition is a single transaction.
+//
+// `context` accumulates each step's structured output so later steps can
+// read what earlier ones produced (e.g. step 1 returns disk usage 92 %,
+// step 2 branches on that). It's a free-form JSON bag.
+model WorkflowExecution {
+  id              String                  @id @default(cuid())
+  organizationId  String
+  ticketId        String
+  workflowKey     String
+  status          WorkflowExecutionStatus @default(RUNNING)
+  // The step currently being run / waited on. Null when finished.
+  currentStepKey  String?
+  // Free-form output bag. Each step writes `context[stepKey] = result`.
+  context         Json                    @default("{}")
+  /// User-friendly error summary if status = FAILED.
+  errorReason     String?
+  startedAt       DateTime                @default(now())
+  completedAt     DateTime?
+
+  organization    Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticket          Ticket                  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  steps           WorkflowStepExecution[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, ticketId])
+}
+
+model WorkflowStepExecution {
+  id                  String              @id @default(cuid())
+  workflowExecutionId String
+  stepKey             String
+  sequence            Int                 // order in the workflow (0-based)
+  status              WorkflowStepStatus  @default(PENDING)
+  // What the step's execute() returned. Persisted so we don't re-run on resume.
+  output              Json                @default("{}")
+  errorReason         String?
+  // For WAITING — earliest time the executor should re-attempt this step.
+  resumeAt            DateTime?
+  startedAt           DateTime?
+  completedAt         DateTime?
+
+  workflowExecution   WorkflowExecution   @relation(fields: [workflowExecutionId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowExecutionId, stepKey])
+  @@index([workflowExecutionId, sequence])
+}
+
+// Phase 16 — learned ML models trained from RemediationOutcome history.
+//
+// One organization can have multiple modelKeys (e.g.
+// "remediation_classifier" today; "ticket_classifier" tomorrow). Each
+// training run inserts a new row with a higher `version`; the brain
+// reads whichever row has `active = true` for that (org, modelKey).
+// Older rows are kept for audit + rollback (admin can flip active back).
+//
+// `weights` is a JSON object — exact shape is `LogisticModel` (see
+// server/src/ml/logistic.ts), kept opaque at the DB layer so we can
+// evolve the model family without a migration.
+model MlModel {
+  id              String   @id @default(cuid())
+  organizationId  String
+  modelKey        String   // e.g. "remediation_classifier"
+  version         Int      // monotonically increasing per (org, modelKey)
+  active          Boolean  @default(false)
+  /// Opaque trained-model payload — weights + bias + feature names.
+  weights         Json
+  /// Snapshot metrics from the training run — accuracy, AUC-ish, sample count.
+  metrics         Json     @default("{}")
+  trainedAt       DateTime @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, modelKey, version])
+  @@index([organizationId, modelKey, active])
+}
+
+// Phase 20 — Per-attempt feature snapshot for ML training.
+//
+// Each row records ONE runbook attempt with the full feature vector that was
+// in play at the time, plus the label (success / failure). This is the raw
+// training data the GBT trainer reads — previously the trainer expanded the
+// aggregate RemediationOutcome counts, which lost per-attempt context (which
+// device, what time-of-day, what concurrent load).
+//
+// Schema is intentionally minimal: a feature names array + a parallel
+// features array stored as JSON. Same shape used at inference time.
+model RemediationAttempt {
+  id              String   @id @default(cuid())
+  organizationId  String
+  ticketId        String?
+  runbookExecutionId String?
+  runbookKey      String
+  // Same feature vector shape as MlModel — names + values arrays.
+  featureNames    Json     // string[]
+  features        Json     // number[]
+  // 1 = SUCCEEDED, 0 = FAILED / ESCALATED. Anything else is excluded from training.
+  label           Int
+  recordedAt      DateTime @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, runbookKey, recordedAt])
+}
+
+// ─── Phase 25 — Threat intelligence ────────────────────────────────────
+//
+// `ThreatIntel` is a global, NON-tenant-scoped catalog of items pulled
+// from external feeds (CISA KEV, NVD, GHSA, security news RSS). Each row
+// is shared across every tenant — only the *matches* are per-org.
+//
+// `ThreatMatch` is the org-scoped row that fires when a piece of threat
+// intel correlates with this tenant's assets (a device on the affected
+// OS, a ticket mentioning a known IOC, etc.). One match per (org, intel,
+// reason) — re-discovering the same match doesn't pile up rows.
+
+enum ThreatKind {
+  CVE             // CVE-2024-XXXXX from NVD or GHSA
+  KEV             // CVE on CISA's Known-Exploited-Vulnerabilities catalog
+  IOC_IP          // an IP address known to be malicious
+  IOC_DOMAIN      // a malicious domain
+  IOC_HASH        // a file hash (SHA256 typically)
+  NEWS            // a security-news article (early-warning before formal CVE)
+  ADVISORY        // a vendor advisory (Microsoft / Cisco / etc.)
+}
+
+enum ThreatSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model ThreatIntel {
+  id              String          @id @default(cuid())
+  kind            ThreatKind
+  /// Source identifier — e.g. "cisa_kev", "nvd", "ghsa", "hacker_news_rss"
+  source          String
+  /// Stable external ID — CVE id ("CVE-2024-1234"), GHSA id, NVD id, etc.
+  externalId      String
+  title           String
+  /// Full description / summary. Truncated to 4 KB at ingestion to keep rows reasonable.
+  description     String
+  severity        ThreatSeverity  @default(MEDIUM)
+  /// CVSS v3 base score 0-10 where applicable.
+  cvss            Float?
+  /// Free-form references — vendor advisory URLs, PoC links, news links.
+  references      Json            @default("[]")
+  /// Affected products/CPEs/keywords for fast matching.
+  affected        Json            @default("[]")
+  /// CISA KEV-specific flags: knownRansomware, dueDate, requiredAction.
+  kevMetadata     Json?
+  publishedAt     DateTime
+  ingestedAt      DateTime        @default(now())
+
+  matches         ThreatMatch[]
+
+  @@unique([source, externalId])
+  @@index([kind, severity])
+  @@index([publishedAt])
+}
+
+enum ThreatMatchStatus {
+  OPEN
+  ACKNOWLEDGED
+  CONVERTED_TO_TICKET   // a ticket was opened in response
+  DISMISSED             // admin marked false-positive
+}
+
+model ThreatMatch {
+  id              String              @id @default(cuid())
+  organizationId  String
+  threatIntelId   String
+  /// Why we think this intel is relevant to this org.
+  /// e.g. "device hostname X runs Windows 11 23H2 (affected)"
+  reason          String
+  /// Affected entity IDs by type. Free-form JSON; renderer picks fields.
+  /// e.g. { deviceIds: ["dev_1","dev_2"], ticketIds: [...] }
+  evidence        Json                @default("{}")
+  status          ThreatMatchStatus   @default(OPEN)
+  acknowledgedAt  DateTime?
+  acknowledgedBy  String?
+  /// If status=CONVERTED_TO_TICKET, the resulting Ticket.id.
+  resultingTicketId String?
+  createdAt       DateTime            @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  threatIntel     ThreatIntel  @relation(fields: [threatIntelId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, threatIntelId, reason])
+  @@index([organizationId, status, createdAt])
+}
+
+// ─── Phase 26 — Daily agentic defender ─────────────────────────────────
+//
+// Once a day the defender runs a Claude tool-use loop over the last 24h
+// of threat-intel + matches + detections for one org. Each run is
+// recorded here:
+//
+//   • situation    — the JSON snapshot of inputs (counts, key facts)
+//   • briefing     — the agent's Markdown summary for humans
+//   • iterations   — # of Claude round-trips
+//   • toolCalls    — what tools the agent invoked + their arguments
+//   • decisions    — what concrete actions the agent took (tickets
+//                    opened, matches ack'd, runbooks recommended)
+//
+// The next morning's run feeds the previous run's `decisions` + the
+// observable outcomes (did the tickets get resolved? did the dismissed
+// matches turn out to be exploited?) back into the prompt — that's the
+// learning loop.
+
+enum DefenderStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  /// Stopped at the iteration cap; partial output preserved.
+  HALTED
+}
+
+model DefenderRun {
+  id             String         @id @default(cuid())
+  organizationId String
+  /// The UTC day this run represents (date-only key).
+  runDate        DateTime
+  status         DefenderStatus @default(RUNNING)
+  /// JSON object: counts + key facts handed to the agent at start.
+  situation      Json           @default("{}")
+  /// JSON array of {tool, args, result, ts}.
+  toolCalls      Json           @default("[]")
+  /// JSON array of typed decisions (see DefenderDecision in code).
+  decisions      Json           @default("[]")
+  /// Final Markdown briefing the agent wrote (the user-facing artefact).
+  briefing       String?
+  iterations     Int            @default(0)
+  errorReason    String?
+  startedAt      DateTime       @default(now())
+  completedAt    DateTime?
+  /// Set once we measure outcomes for this run's decisions (typ. +24h).
+  outcomesMeasuredAt DateTime?
+  /// JSON: per-decision outcome stats (matched / dismissed / open etc.).
+  outcomes       Json           @default("{}")
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, runDate])
+  @@index([organizationId, status, startedAt])
+}
+
+// ─── Phase 27 — Behavioural detection (MITRE ATT&CK + sensor + AI rules) ───
+//
+// AttackTechnique is the global MITRE ATT&CK catalog (~600 techniques).
+// Refreshed weekly from MITRE's STIX 2.1 feed. Not tenant-scoped — every
+// org sees the same library.
+
+model AttackTechnique {
+  id           String   @id @default(cuid())
+  /// e.g. "T1059.001" — MITRE's external ID.
+  mitreId      String   @unique
+  name         String
+  /// e.g. "Execution", "Persistence", "Credential Access"
+  tactic       String
+  description  String
+  /// JSON string[] — what telemetry detects this (Process monitoring, etc.)
+  dataSources  Json     @default("[]")
+  /// JSON string[] — Windows, Linux, macOS, Cloud, etc.
+  platforms    Json     @default("[]")
+  /// JSON string[] — mitigation IDs.
+  mitigations  Json     @default("[]")
+  /// MITRE revoked-flag — true for techniques that have been deprecated.
+  revoked      Boolean  @default(false)
+  /// MITRE last-modified-date.
+  modified     DateTime
+  ingestedAt   DateTime @default(now())
+
+  generatedRules GeneratedRule[]
+
+  @@index([tactic])
+  @@index([revoked])
+}
+
+// SensorAlert is one event from a third-party sensor (Wazuh today; CrowdStrike
+// Falcon EDR / SentinelOne tomorrow). The schema is shaped around Wazuh's
+// alert format because that's the open-source default — other sources are
+// normalized on ingest.
+model SensorAlert {
+  id               String   @id @default(cuid())
+  organizationId   String
+  /// "wazuh", "falcon", "sentinelone", "custom"
+  source           String
+  /// The sensor's internal alert id (Wazuh's `id`).
+  externalId       String
+  /// Wazuh's rule.id / Falcon's detect.id, etc.
+  sourceRuleId     String
+  /// 0-15 in Wazuh's scale; we copy verbatim.
+  level            Int
+  description      String
+  /// Hostname/agent that generated the alert.
+  agentName        String?
+  srcIp            String?
+  dstIp            String?
+  /// MITRE technique id if the sensor tagged it (Wazuh does for many rules).
+  mitreTechniqueId String?
+  /// Full raw alert (capped at 16KB) for forensics + AI replay.
+  rawAlert         Json     @default("{}")
+  createdAt        DateTime @default(now())
+
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, source, externalId])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, mitreTechniqueId, createdAt])
+}
+
+enum GeneratedRuleStatus {
+  DRAFT       // AI-generated, not yet tested
+  TESTING     // simulated against history — has falsePositive/truePositive estimates
+  APPROVED    // human reviewed + approved — active in production
+  RETIRED     // taken out of production (too noisy, replaced, etc.)
+  REJECTED    // human reviewed + rejected (with reason)
+}
+
+// GeneratedRule is a detection rule the AI proposes or a human writes.
+// Rules use a small JSON DSL (server/src/rules/dsl.ts) so they can be
+// safely evaluated without code-execution risk.
+//
+// `organizationId` null = global rule available to every tenant; non-null
+// = tenant-specific rule.
+model GeneratedRule {
+  id              String              @id @default(cuid())
+  organizationId  String?
+  attackTechniqueId String?
+  title           String
+  description     String
+  severity        DetectionSeverity   @default(MEDIUM)
+  /// The rule logic. Shape defined by server/src/rules/dsl.ts (RuleSpec).
+  logic           Json
+  status          GeneratedRuleStatus @default(DRAFT)
+  /// JSON: { wouldHaveCaught: N, falsePositivesEstimated: N, samplesEvaluated: N }
+  testResults     Json                @default("{}")
+  /// "ai_daily_study" or "human:<userId>"
+  createdBy       String
+  /// Free-text rationale the AI wrote when proposing.
+  rationale       String?
+  approvedBy      String?
+  approvedAt      DateTime?
+  rejectionReason String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  organization    Organization?    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  attackTechnique AttackTechnique? @relation(fields: [attackTechniqueId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status, createdAt])
+  @@index([attackTechniqueId])
+}

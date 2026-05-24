@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay-client
+  namespace: relay
+  labels: { app: relay-client }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: relay-client }
+  template:
+    metadata:
+      labels: { app: relay-client }
+    spec:
+      containers:
+        - name: client
+          image: ghcr.io/your-org/relay-client:latest  # CHANGE — static build served by nginx
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 80, name: http }]
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 200m, memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101  # nginx
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay-client
+  namespace: relay
+  labels: { app: relay-client }
+spec:
+  ports: [{ port: 80, targetPort: http, name: http }]
+  selector: { app: relay-client }
+  type: ClusterIP

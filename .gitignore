@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+.qodo/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Prisma
+server/prisma/migrations/dev.db*
+
+# Emitted by tsc -b for composite projects (vite.config.ts)
+client/vite.config.js
+client/vite.config.d.ts
+
+# Local docker-compose overrides
+docker-compose.override.yml
+
+# Test output
+coverage/
+
+# Docker volumes
+docker/data/

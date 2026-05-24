@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay-server
+  namespace: {{ include "relay.namespace" . }}
+  labels:
+    app: relay-server
+    {{- include "relay.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.server.replicas }}
+  selector:
+    matchLabels: { app: relay-server }
+  template:
+    metadata:
+      labels: { app: relay-server }
+      {{- if .Values.server.prometheusScrape }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "4000"
+        prometheus.io/path:   "/metrics"
+      {{- end }}
+    spec:
+      containers:
+        - name: server
+          image: "{{ .Values.image.server.repository }}:{{ .Values.image.server.tag }}"
+          imagePullPolicy: {{ .Values.image.server.pullPolicy }}
+          ports: [{ containerPort: 4000, name: http }]
+          envFrom:
+            - configMapRef: { name: relay-config }
+            - secretRef:    { name: relay-secrets }
+          command: ["sh", "-lc"]
+          args:
+            - |
+              set -e
+              npx prisma migrate deploy --schema=prisma/schema.prisma
+              node dist/index.js
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources: {{- toYaml .Values.server.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay-server
+  namespace: {{ include "relay.namespace" . }}
+  labels:
+    app: relay-server
+    {{- include "relay.labels" . | nindent 4 }}
+spec:
+  ports: [{ port: 80, targetPort: http, name: http }]
+  selector: { app: relay-server }
+  type: ClusterIP
+{{- if .Values.server.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: relay-server
+  namespace: {{ include "relay.namespace" . }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: relay-server }
+  minReplicas: {{ .Values.server.hpa.minReplicas }}
+  maxReplicas: {{ .Values.server.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource: { name: cpu,    target: { type: Utilization, averageUtilization: {{ .Values.server.hpa.cpuUtilization }} } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: {{ .Values.server.hpa.memoryUtilization }} } }
+{{- end }}
+{{- if .Values.server.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: relay-server
+  namespace: {{ include "relay.namespace" . }}
+spec:
+  minAvailable: {{ .Values.server.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels: { app: relay-server }
+{{- end }}

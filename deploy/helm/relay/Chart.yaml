@@ -1,0 +1,12 @@
+apiVersion: v2
+name: relay
+description: Relay — IT support automation platform (server + client + Postgres)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [it-support, automation, autopilot, helpdesk]
+home: https://github.com/your-org/relay
+sources:
+  - https://github.com/your-org/relay
+maintainers:
+  - name: Relay maintainers

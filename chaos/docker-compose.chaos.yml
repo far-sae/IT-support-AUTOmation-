@@ -1,0 +1,38 @@
+# Phase 21 — Chaos overlay using Toxiproxy.
+#
+# Layers a Toxiproxy container in front of Postgres so we can inject
+# latency, packet-loss, and full-connection-cuts and observe the server's
+# behaviour under realistic failure modes.
+#
+# Usage (from repo root):
+#   docker compose -f docker-compose.yml -f chaos/docker-compose.chaos.yml up -d
+#
+# Then drive the chaos via toxiproxy-cli (in the toxiproxy container):
+#   docker compose exec toxiproxy /toxiproxy-cli toxic add -t latency -a latency=500 -a jitter=100 relay-pg
+#   docker compose exec toxiproxy /toxiproxy-cli toxic add -t timeout -a timeout=2000 relay-pg
+#   docker compose exec toxiproxy /toxiproxy-cli toxic remove relay-pg latency_downstream
+#
+# Or use the bootstrap script that ships with this folder:
+#   chaos/bootstrap.sh
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: relay-toxiproxy
+    ports:
+      - "8474:8474"   # admin API
+      - "55432:5432"  # proxied Postgres
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./chaos/toxiproxy.json:/config/toxiproxy.json:ro
+    depends_on:
+      - postgres
+
+  server:
+    # Re-point the server at the proxy. From the server's perspective, the
+    # proxy is a normal Postgres listener on host:port toxiproxy:5432.
+    environment:
+      DATABASE_URL: postgresql://relay:relay@toxiproxy:5432/relay?schema=public
+    depends_on:
+      toxiproxy:
+        condition: service_started
